@@ -549,18 +549,22 @@ save_to = r'Z:\Cristina\Section3\NME_DEC\SAEmodels\decModel_wimgF_dualopt_descSt
 
 # to load a prevously DEC model  
 input_size = combX_allNME.shape[1]
-latent_size = [input_size/rxf for rxf in [2,5]] # other: 10,15,25
-varying_mu = [int(np.round(var_mu)) for var_mu in np.linspace(5,10,6)]
+latent_size = [input_size/rxf for rxf in [2]] # other: 10,15,25
+varying_mu = [int(np.round(var_mu)) for var_mu in np.linspace(5,6,1)]
 
 ######################
 # DEC: define num_centers according to clustering variable
 ######################   
 # to load a prevously DEC model  
 for znum in latent_size:
+    cvRForigXAUC = []
+    initAUC = []
+    valAUC = []
+    cvRFZspaceAUC = []       
+    normalizedMI = []
     for num_centers in varying_mu: 
         # batch normalization
         X_train = combX_allNME
-        y_dec_train = y_dec
         y_train = roi_labels
 
         print('Loading autoencoder of znum = {}, mu = {} , post training DEC results'.format(znum,num_centers))
@@ -568,16 +572,10 @@ for znum in latent_size:
 
         with gzip.open(os.path.join(save_to,'dec_model_z{}_mu{}_{}.arg'.format(znum,num_centers,labeltype)), 'rb') as fu:
             dec_model = pickle.load(fu)
-
+          
         with gzip.open(os.path.join(save_to,'outdict_z{}_mu{}_{}.arg'.format(znum,num_centers,labeltype)), 'rb') as fu:
             outdict = pickle.load(fu)
 
-        print('DEC train init AUC = {}'.format(outdict['meanAuc_cv'][0]))
-        max_meanAuc_cv = max(outdict['meanAuc_cv'])
-        indmax_meanAuc_cv = outdict['meanAuc_cv'].index(max_meanAuc_cv)
-        print('DEC train max meanAuc_cv = {}'.format(max_meanAuc_cv))
-        print('DEC validation AUC at max meanAuc_cv = {}'.format(outdict['auc_val'][indmax_meanAuc_cv]))
-        
         #####################
         # prep Z-space MLP fully coneected layer for classification
         #####################
@@ -587,40 +585,42 @@ for znum in latent_size:
         'encoder_0_bias', 'encoder_2_weight', 'encoder_1_weight', 
         'encoder_3_bias', 'encoder_2_bias']
         dec_args = {key: v for key, v in dec_model.items() if key in dec_args_keys}
-        dec_args['dec_mubestacci'] = dec_model['dec_mubestacci']
+        dec_args['dec_mubestacci'] = dec_model['dec_mu']
         
         N = X_train.shape[0]
         all_iter = mx.io.NDArrayIter({'data': X_train}, batch_size=X_train.shape[0], shuffle=False,
                                                   last_batch_handle='pad')   
         ## embedded point zi 
-        aDEC = DECModel(mx.cpu(), X_train, num_centers, 1.0, znum, 'Z:\\Cristina\\Section3\\NME_DEC\\SAEmodels') 
         mxdec_args = {key: mx.nd.array(v) for key, v in dec_args.items() if key != 'dec_mubestacci'}                           
+        aDEC = DECModel(mx.cpu(), X_train, num_centers, 1.0, znum, 'Z:\\Cristina\\Section3\\NME_DEC\\SAEmodels') 
         
         # gather best-Zspace or dec_model['zbestacci']
         zbestacci = model.extract_feature(aDEC.feature, mxdec_args, None, all_iter, X_train.shape[0], aDEC.xpu).values()[0]      
         # compute model-based best-pbestacci or dec_model['pbestacci']
         pbestacci = np.zeros((zbestacci.shape[0], dec_model['num_centers']))
         aDEC.dec_op.forward([zbestacci, dec_args['dec_mubestacci'].asnumpy()], [pbestacci])
+        
+        zbestacci = dec_model['zbestacci']
         pbestacci = dec_model['pbestacci']
 
         # compare soft assignments with known labels (only B or M)
         print '\n... MLP fully coneected layer trained on Z_train tested on Z_test' 
         sep = int(zbestacci.shape[0]*0.10)
-        print(zbestacci.shape)
-        print(pbestacci.shape)
+        #print(zbestacci.shape)
+        #print(pbestacci.shape)
         datalabels = np.asarray(y_train)
         dataZspace = np.concatenate((zbestacci, pbestacci), axis=1) #zbestacci #dec_model['zbestacci']   
         Z = dataZspace[datalabels!='K',:]
         y = datalabels[datalabels!='K']
-        print(Z.shape)
+        #print(Z.shape)
 
         # Do a 5 fold cross-validation
         Z_test = Z[:sep]
         yZ_test = np.asanyarray(y[:sep]=='M').astype(int) 
         Z_train = Z[sep:]
         yZ_train = np.asanyarray(y[sep:]=='M').astype(int) 
-        print(Z_test.shape)
-        print(Z_train.shape)
+        #print(Z_test.shape)
+        #print(Z_train.shape)
         
         # We’ll load MLP using MXNet’s symbolic interface
         dataMLP = mx.sym.Variable('data')
@@ -635,14 +635,17 @@ for znum in latent_size:
         mlp  = mx.sym.SoftmaxOutput(data=fc3, name='softmax')
         # create a trainable module on CPU     
         batch_size = 50
-        MLP_train_iter = mx.io.NDArrayIter(Z_train[train], yZ_train[train], batch_size, shuffle=True)
         mlp_model = mx.mod.Module(symbol=mlp, context=mx.cpu())
-        mlp_model.fit(MLP_train_iter,  # train data
-                          monitor=None,
-                          optimizer='sgd',  # use SGD to train
-                          optimizer_params={'learning_rate':0.1},  # use fixed learning rate
-                          eval_metric= 'acc', #MLPacc(yZ_val, Z_val),  # report accuracy during trainin
-                          num_epoch=100)
+
+        MLP_train_iter = mx.io.NDArrayIter(Z_train, yZ_train, batch_size, shuffle=True)
+        mlp_model.bind(MLP_train_iter.provide_data, MLP_train_iter.provide_label)
+        mlp_model.init_params()        
+        #        mlp_model.fit(MLP_train_iter,  # train data
+        #                          monitor=None,
+        #                          optimizer='sgd',  # use SGD to train
+        #                          optimizer_params={'learning_rate':0.1},  # use fixed learning rate
+        #                          eval_metric= 'acc', #MLPacc(yZ_val, Z_val),  # report accuracy during trainin
+        #                          num_epoch=100)
         mlp_model_params = mlp_model.get_params()[0]
 
         from mxnet import ndarray
@@ -669,7 +672,7 @@ for znum in latent_size:
         for ik,sizeparam in enumerate(l1):
             for jk,savedparam in enumerate(l2):
                 if(sizeparam == savedparam):
-                    print('updating layer parameters: {}'.format(savedparam))
+                    #print('updating layer parameters: {}'.format(savedparam))
                     mlp_model_params[k1[ik]] = arg_params[k2[jk]]
 
         mlp_model.set_params(mlp_model_params, aux_params)
@@ -678,6 +681,7 @@ for znum in latent_size:
         # Z-space MLP fully coneected layer for classification
         #####################
         figROCs = plt.figure(figsize=(9,9))    
+        axaroc = figROCs.add_subplot(1,1,1)
         # Run classifier with cross-validation and plot ROC curves
         cv = StratifiedKFold(n_splits=5)
         # Evaluate a score by cross-validation
@@ -698,7 +702,6 @@ for znum in latent_size:
             print roc_auc
             aucs.append(roc_auc)
             # plot
-            axaroc = figROCs.add_subplot(1,1,1)
             axaroc.plot(fpr, tpr, lw=1, alpha=0.5) # with label add: label='cv %d, AUC %0.2f' % (cvi, roc_auc)
             cvi += 1
             
@@ -719,7 +722,7 @@ for znum in latent_size:
         ################
         # plot AUC on validation set
         ################
-        MLP_heldout_iter = mx.io.NDArrayIter(Z_test, yZ_test, batch_size)   
+        MLP_heldout_iter = mx.io.NDArrayIter(Z_test, None, batch_size)   
         probas_heldout = mlp_model.predict(MLP_heldout_iter)
            
         # Compute ROC curve and area the curve
@@ -733,17 +736,81 @@ for znum in latent_size:
         axaroc.set_ylim([-0.05, 1.05])
         axaroc.set_xlabel('False Positive Rate',fontsize=18)
         axaroc.set_ylabel('True Positive Rate',fontsize=18)
-        axaroc.set_title('ROC LD DEC optimized space={}, all features={} - Unsupervised cv RF classifier'.format(Z.shape[0],Z.shape[1]),fontsize=18)
+        axaroc.set_title('ROC LD DEC optimized space={}, all features={} - Unsupervised DEC cv MLP classifier'.format(Z.shape[0],Z.shape[1]),fontsize=18)
         axaroc.legend(loc="lower right",fontsize=18)
         plt.show()
-
-
-
-
-############################################
-# t-SNE
-############################################
-## plot
+        
+        print('DEC train init AUC = {}'.format(dec_model['meanAuc_cv'][0]))
+        print('DEC train max meanAuc_cv = {}'.format(np.mean(aucs)))
+        print('DEC validation AUC at max meanAuc_cv = {}'.format(auc_val))
+        cvRForigXAUC.append(0.67)
+        initAUC.append(dec_model['meanAuc_cv'][0])
+        cvRFZspaceAUC.append(np.mean(aucs))
+        valAUC.append(auc_val)
+        
+        ################
+        # Calculate NMI: find max soft assignments dec_args
+        ################
+        num_classes = len(np.unique(roi_labels))
+        W = pbestacci.argmax(axis=1)
+        clusters = range(dec_model['num_centers'])
+        num_clusters = len(np.unique(W))
+        
+        MLE_kj = np.zeros((num_clusters,num_classes))
+        absWk = np.zeros((num_clusters))
+        absCj = np.zeros((num_classes))
+        for k in range(num_clusters):
+            # find poinst in cluster k
+            absWk[k] = np.sum(W==k)
+            for j in range(num_classes):
+                # find points of class j
+                absCj[j] = np.sum(y_train_roi_labels==roi_classes[j])
+                # find intersection 
+                ptsk = W==k
+                MLE_kj[k,j] = np.sum(ptsk[y_train_roi_labels==roi_classes[j]])
+        # if not assignment incluster
+        absWk[absWk==0]=0.00001
+        # compute NMI
+        numIwc = np.zeros((num_clusters,num_classes))
+        for k in range(num_clusters):
+            for j in range(num_classes):
+                if(MLE_kj[k,j]!=0):
+                    numIwc[k,j] = MLE_kj[k,j]/N * np.log( N*MLE_kj[k,j]/(absWk[k]*absCj[j]) )
+                
+        Iwk = np.sum(np.sum(numIwc, axis=1), axis=0)       
+        Hc = -np.sum(absCj/N*np.log(absCj/N))
+        Hw = np.sum(absWk/N*np.log(absWk/N))
+        NMI = Iwk/(np.abs(Hc+Hw))
+        print("... num_centers={} DEC normalizedMI = {}".format(num_centers,NMI))
+        normalizedMI.append(NMI)
+        print("========================\n")
+    
+    # plot latent space Accuracies vs. original
+    colors = plt.cm.jet(np.linspace(0, 1, 16))
+    fig2 = plt.figure(figsize=(20,6))
+    #ax2 = plt.axes()
+    sns.set_context("notebook")
+    ax1 = fig2.add_subplot(2,1,1)
+    ax1.plot(varying_mu, cvRFZspaceAUC, color=colors[0], ls=':', label='cvRFZspaceAUC')
+    ax1.plot(varying_mu, valAUC, color=colors[2], label='valAUC')
+    ax1.plot(varying_mu, initAUC, color=colors[4], label='initAUC')
+    ax1.plot(varying_mu, cvRForigXAUC, color=colors[6], label='cvRForigXAUC')
+    h1, l1 = ax1.get_legend_handles_labels()
+    ax1.legend(h1, l1, loc='center left', bbox_to_anchor=(1, 0.5), prop={'size':12})
+    
+    ax2 = fig2.add_subplot(2,1,2)
+    ax2.plot(varying_mu, normalizedMI, color=colors[8], label='normalizedMI')
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax2.legend(h2, l2, loc='center left', bbox_to_anchor=(1, 0.5), prop={'size':12})
+    ax2.set_xlabel('# clusters',fontsize=14)
+    ax1.set_title('Performance of DEC optimized Z-space classification, Reduction of HD size by x{}, LD size={}'.format(input_size/znum, znum),fontsize=14)
+        
+        
+'''
+##################################################################
+## 5) t-SNE
+################################################################## 
+'''        
 figtsne = plt.figure(figsize=(12,16))
 axtsne = figtsne.add_subplot(1,1,1)
             
@@ -753,5 +820,4 @@ tsne = TSNE(n_components=2, perplexity=15, learning_rate=125,
 Z_tsne = tsne.fit_transform(Z)   
    
 plot_embedding_unsuper_NMEdist_intenh(Z_tsne, dec_model['named_y'], axtsne, title='final tsne: Acc={}\n'.format(max(dec_model['bestacci'])), legend=True)
-
 
